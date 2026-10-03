@@ -1,5 +1,6 @@
 use std::array;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use glam::{Mat3, Vec2};
@@ -25,9 +26,11 @@ use crate::utils::region::TransformedRegion;
 pub struct Xray {
     // The buffers are per-render-target to avoid constant rerendering when screencasting.
     pub background: [Rc<RefCell<EffectBuffer>>; RenderTarget::COUNT],
+    /// Allocated only for visible workspaces with scoped background layers.
+    pub workspace_backgrounds: HashMap<u64, [Rc<RefCell<EffectBuffer>>; RenderTarget::COUNT]>,
     pub backdrop: [Rc<RefCell<EffectBuffer>>; RenderTarget::COUNT],
     pub backdrop_color: Color32F,
-    pub workspaces: Vec<(Rectangle<f64, Logical>, Color32F)>,
+    pub workspaces: Vec<(u64, Rectangle<f64, Logical>, Color32F)>,
 }
 
 /// Position for drawing xray background.
@@ -87,6 +90,7 @@ impl Xray {
     pub fn new() -> Self {
         Self {
             background: array::from_fn(|_| Rc::new(RefCell::new(EffectBuffer::new()))),
+            workspace_backgrounds: HashMap::new(),
             backdrop: array::from_fn(|_| Rc::new(RefCell::new(EffectBuffer::new()))),
             backdrop_color: Color32F::TRANSPARENT,
             workspaces: Vec::new(),
@@ -124,17 +128,24 @@ impl Xray {
 
         let mut skip_backdrop = intersection_with_backdrop.is_none();
 
-        let mut background = self.background[ctx.target as usize].borrow_mut();
-        let prev = background.commit();
-        if background.prepare(ctx.renderer, blur) {
-            if background.commit() != prev {
-                trace!("background damaged");
+        for (workspace_id, ws_geo, bg_color) in &self.workspaces {
+            if ws_geo.intersection(geo_in_backdrop).is_none() {
+                continue;
             }
+            let buffers = self
+                .workspace_backgrounds
+                .get(workspace_id)
+                .unwrap_or(&self.background);
+            let mut background = buffers[ctx.target as usize].borrow_mut();
+            let prev = background.commit();
+            if background.prepare(ctx.renderer, blur) {
+                if background.commit() != prev {
+                    trace!("background damaged");
+                }
 
-            let clip_geo_size = Vec2::new(clip_geo.size.w as f32, clip_geo.size.h as f32);
-            let buf_size = background.logical_size();
+                let clip_geo_size = Vec2::new(clip_geo.size.w as f32, clip_geo.size.h as f32);
+                let buf_size = background.logical_size();
 
-            for (ws_geo, bg_color) in &self.workspaces {
                 // If the background color is opaque, check if the workspace fully covers the
                 // element. In this case, we will skip the backdrop element since it's fully
                 // covered.
@@ -188,7 +199,7 @@ impl Xray {
                 geometry.loc += params.geometry.loc;
 
                 let elem = XrayElement {
-                    buffer: self.background[ctx.target as usize].clone(),
+                    buffer: buffers[ctx.target as usize].clone(),
                     id: background.id().clone(),
                     geometry,
                     src,

@@ -330,6 +330,20 @@ impl XdgShellHandler for State {
             return;
         };
 
+        if self.niri.mapped_layer_surfaces.values().any(|mapped| {
+            mapped.surface().wl_surface() == &root
+                && mapped.rules().workspace.is_some()
+                && (self.niri.layout.is_overview_open()
+                    || !self.niri.layer_visible_on_active_workspace(mapped))
+        }) {
+            // A grab request precedes the initial commit, so this popup may
+            // not yet be in PopupManager's tree. Dismiss the resource directly.
+            if let PopupKind::Xdg(surface) = &popup {
+                surface.send_popup_done();
+            }
+            return;
+        }
+
         // We need to hand out the grab in a way consistent with what update_keyboard_focus()
         // thinks the current focus is, otherwise it will desync and cause weird issues with
         // keyboard focus being at the wrong place.

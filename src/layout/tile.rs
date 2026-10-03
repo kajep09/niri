@@ -1494,7 +1494,17 @@ impl<W: LayoutElement> Tile<W> {
         let mut screencast_backdrop = None;
         let mut output_background = None;
         let mut output_backdrop = None;
+        let mut saved_workspace_backgrounds = Vec::new();
         if let Some(xray) = &mut xray {
+            let (destination, source) = if xray_has_blocked_out_layers {
+                (output_idx, screencast_idx)
+            } else {
+                (screencast_idx, output_idx)
+            };
+            for (id, buffers) in &mut xray.workspace_backgrounds {
+                saved_workspace_backgrounds.push((*id, Rc::clone(&buffers[destination])));
+                buffers[destination] = Rc::clone(&buffers[source]);
+            }
             screencast_background = Some(Rc::clone(&xray.background[screencast_idx]));
             screencast_backdrop = Some(Rc::clone(&xray.backdrop[screencast_idx]));
             output_background = Some(Rc::clone(&xray.background[output_idx]));
@@ -1539,6 +1549,14 @@ impl<W: LayoutElement> Tile<W> {
 
         // Put everything back to normal.
         if let Some(xray) = &mut xray {
+            let destination = if xray_has_blocked_out_layers {
+                output_idx
+            } else {
+                screencast_idx
+            };
+            for (id, buffer) in saved_workspace_backgrounds {
+                xray.workspace_backgrounds.get_mut(&id).unwrap()[destination] = buffer;
+            }
             if xray_has_blocked_out_layers {
                 xray.background[output_idx] = output_background.take().unwrap();
                 xray.backdrop[output_idx] = output_backdrop.take().unwrap();

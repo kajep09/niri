@@ -1239,6 +1239,28 @@ impl State {
     }
 
     pub fn update_keyboard_focus(&mut self) {
+        // Pointer-only popup grabs must also end when their workspace disappears
+        // from input eligibility, even if keyboard focus itself hasn't changed.
+        let hidden_scoped_grab = self.niri.popup_grab.as_ref().is_some_and(|grab| {
+            self.niri.mapped_layer_surfaces.values().any(|mapped| {
+                mapped.surface().wl_surface() == &grab.root
+                    && mapped.rules().workspace.is_some()
+                    && (self.niri.layout.is_overview_open()
+                        || !self.niri.layer_visible_on_active_workspace(mapped))
+            })
+        });
+        if hidden_scoped_grab {
+            let mut grab = self.niri.popup_grab.take().unwrap();
+            grab.grab.ungrab(PopupUngrabStrategy::All);
+            if grab.has_keyboard_grab {
+                self.niri.seat.get_keyboard().unwrap().unset_grab(self);
+            }
+            self.niri.seat.get_pointer().unwrap().unset_grab(
+                self,
+                SERIAL_COUNTER.next_serial(),
+                InputTime::now(),
+            );
+        }
         // Clean up on-demand layer surface focus if necessary.
         if let Some(surface) = &self.niri.layer_shell_on_demand_focus {
             // Still alive and has on-demand interactivity.
@@ -1248,7 +1270,9 @@ impl State {
 
             if let Some(mapped) = self.niri.mapped_layer_surfaces.get(surface) {
                 // Check if it moved to the overview backdrop.
-                if mapped.place_within_backdrop() {
+                if mapped.place_within_backdrop()
+                    || !self.niri.layer_visible_on_active_workspace(mapped)
+                {
                     good = false;
                 }
             } else {
@@ -1281,6 +1305,14 @@ impl State {
             let layer_grab = self.niri.popup_grab.as_ref().and_then(|g| {
                 layers
                     .layer_for_surface(&g.root, WindowSurfaceType::TOPLEVEL)
+                    .filter(|l| {
+                        self.niri
+                            .mapped_layer_surfaces
+                            .get(l)
+                            .is_some_and(|mapped| {
+                                self.niri.layer_visible_on_active_workspace(mapped)
+                            })
+                    })
                     .and_then(|l| l.can_receive_keyboard_focus().then(|| (&g.root, l.layer())))
             });
             let grab_on_layer = |layer: Layer| {
@@ -1308,7 +1340,9 @@ impl State {
                     }
 
                     let mapped = self.niri.mapped_layer_surfaces.get(surface)?;
-                    if mapped.place_within_backdrop() {
+                    if mapped.place_within_backdrop()
+                        || !self.niri.layer_visible_on_active_workspace(mapped)
+                    {
                         return None;
                     }
 
@@ -3339,7 +3373,10 @@ impl Niri {
 
                     // Background and bottom layers move together with the workspaces.
                     let mon = self.layout.monitor_for_output(output)?;
-                    let (_, geo) = mon.workspace_under(pos_within_output)?;
+                    let (ws, geo) = mon.workspace_under(pos_within_output)?;
+                    if !Self::layer_visible_on_workspace(mapped, Some(ws)) {
+                        return None;
+                    }
                     layer_pos_within_output += geo.loc;
 
                     let surface_type = WindowSurfaceType::POPUP | WindowSurfaceType::SUBSURFACE;
@@ -3502,7 +3539,10 @@ impl Niri {
                     // Background and bottom layers move together with the workspaces.
                     if matches!(layer, Layer::Background | Layer::Bottom) {
                         let mon = self.layout.monitor_for_output(output)?;
-                        let (_, geo) = mon.workspace_under(pos_within_output)?;
+                        let (ws, geo) = mon.workspace_under(pos_within_output)?;
+                        if !Self::layer_visible_on_workspace(mapped, Some(ws)) {
+                            return None;
+                        }
                         layer_pos_within_output += geo.loc;
                         // Don't need to deal with zoom here because in the overview background and
                         // bottom layers don't receive input.
@@ -4267,13 +4307,45 @@ impl Niri {
 
                 state.xray.workspaces.clear();
                 let mon = self.layout.monitor_for_output(out).unwrap();
+                let layer_map = layer_map_for_output(out);
+                let mut scoped = HashSet::new();
                 for (ws, geo) in mon.workspaces_with_render_geo() {
                     let bg_color = ws.render_background().color();
-                    state.xray.workspaces.push((geo, bg_color));
+                    state.xray.workspaces.push((ws.id().get(), geo, bg_color));
+                    if layer_map.layers_on(Layer::Background).any(|layer| {
+                        self.mapped_layer_surfaces.get(layer).is_some_and(|mapped| {
+                            mapped.rules().workspace.is_some()
+                                && Self::layer_visible_on_workspace(mapped, Some(ws))
+                        })
+                    }) {
+                        scoped.insert(ws.id().get());
+                    }
+                }
+                state
+                    .xray
+                    .workspace_backgrounds
+                    .retain(|id, _| scoped.contains(id));
+                for id in scoped {
+                    state
+                        .xray
+                        .workspace_backgrounds
+                        .entry(id)
+                        .or_insert_with(|| {
+                            std::array::from_fn(|_| {
+                                Rc::new(RefCell::new(
+                                    crate::render_helpers::effect_buffer::EffectBuffer::new(),
+                                ))
+                            })
+                        });
                 }
                 state.xray.backdrop_color = state.backdrop_buffer.color();
                 let blur_options = BlurOptions::from(self.config.borrow().blur);
-                for buf in &state.xray.background {
+                for buf in state
+                    .xray
+                    .background
+                    .iter()
+                    .chain(state.xray.workspace_backgrounds.values().flatten())
+                {
                     let mut buffer = buf.borrow_mut();
                     buffer.update_size(size, scale);
                     buffer.update_blur_options(blur_options);
@@ -4284,7 +4356,6 @@ impl Niri {
                     buffer.update_blur_options(blur_options);
                 }
 
-                let layer_map = layer_map_for_output(out);
                 for surface in layer_map.layers_on(Layer::Background) {
                     let Some(mapped) = self.mapped_layer_surfaces.get_mut(surface) else {
                         continue;
@@ -4461,9 +4532,10 @@ impl Niri {
         // We use macros instead of closures to avoid borrowing issues (renderer and push() go
         // into different functions).
         macro_rules! push_popups_from_layer {
-            ($layer:expr, $ns:expr, $xray_pos:expr, $backdrop:expr, $push:expr) => {{
+            ($layer:expr, $workspace:expr, $ns:expr, $xray_pos:expr, $backdrop:expr, $push:expr) => {{
                 self.render_layer_popups(
                     ctx.r(),
+                    $workspace,
                     $ns,
                     &layer_map,
                     $layer,
@@ -4473,23 +4545,34 @@ impl Niri {
                 );
             }};
             ($layer:expr, true) => {{
-                push_popups_from_layer!($layer, None, XrayPos::default(), true, &mut |elem| push(
-                    elem.into()
-                ));
+                push_popups_from_layer!(
+                    $layer,
+                    None,
+                    None,
+                    XrayPos::default(),
+                    true,
+                    &mut |elem| push(elem.into())
+                );
             }};
-            ($layer:expr, $ns:expr, $xray_pos:expr, $push:expr) => {{
-                push_popups_from_layer!($layer, $ns, $xray_pos, false, $push);
+            ($layer:expr, $workspace:expr, $ns:expr, $xray_pos:expr, $push:expr) => {{
+                push_popups_from_layer!($layer, $workspace, $ns, $xray_pos, false, $push);
             }};
             ($layer:expr) => {{
-                push_popups_from_layer!($layer, None, XrayPos::default(), false, &mut |elem| push(
-                    elem.into()
-                ));
+                push_popups_from_layer!(
+                    $layer,
+                    None,
+                    None,
+                    XrayPos::default(),
+                    false,
+                    &mut |elem| push(elem.into())
+                );
             }};
         }
         macro_rules! push_normal_from_layer {
-            ($layer:expr, $ns:expr, $xray_pos:expr, $backdrop:expr, $push:expr) => {{
+            ($layer:expr, $workspace:expr, $ns:expr, $xray_pos:expr, $backdrop:expr, $push:expr) => {{
                 self.render_layer_normal(
                     ctx.r(),
+                    $workspace,
                     $ns,
                     &layer_map,
                     $layer,
@@ -4499,17 +4582,27 @@ impl Niri {
                 );
             }};
             ($layer:expr, true) => {{
-                push_normal_from_layer!($layer, None, XrayPos::default(), true, &mut |elem| {
-                    push(elem.into())
-                });
+                push_normal_from_layer!(
+                    $layer,
+                    None,
+                    None,
+                    XrayPos::default(),
+                    true,
+                    &mut |elem| { push(elem.into()) }
+                );
             }};
-            ($layer:expr, $ns:expr, $xray_pos:expr, $push:expr) => {{
-                push_normal_from_layer!($layer, $ns, $xray_pos, false, $push);
+            ($layer:expr, $workspace:expr, $ns:expr, $xray_pos:expr, $push:expr) => {{
+                push_normal_from_layer!($layer, $workspace, $ns, $xray_pos, false, $push);
             }};
             ($layer:expr) => {{
-                push_normal_from_layer!($layer, None, XrayPos::default(), false, &mut |elem| {
-                    push(elem.into())
-                });
+                push_normal_from_layer!(
+                    $layer,
+                    None,
+                    None,
+                    XrayPos::default(),
+                    false,
+                    &mut |elem| { push(elem.into()) }
+                );
             }};
         }
 
@@ -4530,13 +4623,37 @@ impl Niri {
             push_popups_from_layer!(Layer::Top);
             push_normal_from_layer!(Layer::Top);
 
-            push_popups_from_layer!(Layer::Bottom);
-            push_popups_from_layer!(Layer::Background);
-            push_normal_from_layer!(Layer::Bottom);
-            push_normal_from_layer!(Layer::Background);
-
             // We don't expect more than one workspace when render_above_top_layer().
             if let Some((ws, _geo)) = mon.workspaces_with_render_geo().next() {
+                let ns = Some(ws.id().get() as usize);
+                push_popups_from_layer!(
+                    Layer::Bottom,
+                    Some(ws),
+                    ns,
+                    XrayPos::default(),
+                    &mut |elem| push(elem.into())
+                );
+                push_popups_from_layer!(
+                    Layer::Background,
+                    Some(ws),
+                    ns,
+                    XrayPos::default(),
+                    &mut |elem| { push(elem.into()) }
+                );
+                push_normal_from_layer!(
+                    Layer::Bottom,
+                    Some(ws),
+                    ns,
+                    XrayPos::default(),
+                    &mut |elem| push(elem.into())
+                );
+                push_normal_from_layer!(
+                    Layer::Background,
+                    Some(ws),
+                    ns,
+                    XrayPos::default(),
+                    &mut |elem| { push(elem.into()) }
+                );
                 push(ws.render_background().into());
             }
         } else {
@@ -4562,8 +4679,8 @@ impl Niri {
             for (ws, geo) in mon.workspaces_with_render_geo() {
                 let ns = Some(ws.id().get() as usize);
                 let xray_pos = XrayPos::new(geo.loc, zoom);
-                push_popups_from_layer!(Layer::Bottom, ns, xray_pos, process!(geo));
-                push_popups_from_layer!(Layer::Background, ns, xray_pos, process!(geo));
+                push_popups_from_layer!(Layer::Bottom, Some(ws), ns, xray_pos, process!(geo));
+                push_popups_from_layer!(Layer::Background, Some(ws), ns, xray_pos, process!(geo));
             }
 
             mon.render_workspaces(ctx.r(), focus_ring, &mut |elem| push(elem.into()));
@@ -4579,8 +4696,8 @@ impl Niri {
                 // damage tracker.
                 let ns = Some(ws.id().get() as usize);
                 let xray_pos = XrayPos::new(geo.loc, zoom);
-                push_normal_from_layer!(Layer::Bottom, ns, xray_pos, process!(geo));
-                push_normal_from_layer!(Layer::Background, ns, xray_pos, process!(geo));
+                push_normal_from_layer!(Layer::Bottom, Some(ws), ns, xray_pos, process!(geo));
+                push_normal_from_layer!(Layer::Background, Some(ws), ns, xray_pos, process!(geo));
 
                 process!(geo)(ws.render_background());
             }
@@ -4624,6 +4741,7 @@ impl Niri {
             self.render_layer_normal(
                 ctx.r(),
                 None,
+                None,
                 &layer_map,
                 Layer::Background,
                 XrayPos::default(),
@@ -4634,12 +4752,34 @@ impl Niri {
             elements.shrink_to_fit();
         }
 
+        for (id, buffers) in &xray.workspace_backgrounds {
+            let workspace = self
+                .layout
+                .workspaces()
+                .find_map(|(_, _, ws)| (ws.id().get() == *id).then_some(ws));
+            let mut buffer = buffers[ctx.target as usize].borrow_mut();
+            let elements = buffer.elements();
+            elements.clear();
+            self.render_layer_normal(
+                ctx.r(),
+                workspace,
+                None,
+                &layer_map,
+                Layer::Background,
+                XrayPos::default(),
+                false,
+                &mut |elem| elements.push(elem.into()),
+            );
+            elements.shrink_to_fit();
+        }
+
         let mut buffer = xray.backdrop[ctx.target as usize].borrow_mut();
         {
             let elements = buffer.elements();
             elements.clear();
             self.render_layer_normal(
                 ctx.r(),
+                None,
                 None,
                 &layer_map,
                 Layer::Background,
@@ -4658,7 +4798,11 @@ impl Niri {
 
         // Clear the xray elements for all render targets after all rendering that could use them
         // did so.
-        for buf in &xray.background {
+        for buf in xray
+            .background
+            .iter()
+            .chain(xray.workspace_backgrounds.values().flatten())
+        {
             buf.borrow_mut().elements().clear();
         }
         for buf in &xray.backdrop {
@@ -4700,10 +4844,26 @@ impl Niri {
         })
     }
 
+    pub(crate) fn layer_visible_on_workspace(
+        mapped: &MappedLayer,
+        workspace: Option<&Workspace<Mapped>>,
+    ) -> bool {
+        mapped.rules().workspace.as_ref().is_none_or(|target| {
+            workspace.is_some_and(|ws| target.matches(ws.id().get(), ws.name().map(String::as_str)))
+        })
+    }
+
+    pub(crate) fn layer_visible_on_active_workspace(&self, mapped: &MappedLayer) -> bool {
+        // Keyboard focus is selected only among layers on the active output.
+        // Do not acquire a LayerMap here: callers may already hold its lock.
+        Self::layer_visible_on_workspace(mapped, self.layout.active_workspace())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn render_layer_normal<R: NiriRenderer>(
         &self,
         mut ctx: RenderCtx<R>,
+        workspace: Option<&Workspace<Mapped>>,
         ns: Option<usize>,
         layer_map: &LayerMap,
         layer: Layer,
@@ -4712,6 +4872,9 @@ impl Niri {
         push: &mut dyn FnMut(LayerSurfaceRenderElement<R>),
     ) {
         for (mapped, geo) in self.layers_in_render_order(layer_map, layer, for_backdrop) {
+            if !Self::layer_visible_on_workspace(mapped, workspace) {
+                continue;
+            }
             let loc = geo.loc.to_f64();
             let xray_pos = xray_pos.offset(loc);
             mapped.render_normal(ctx.r(), ns, loc, xray_pos, push);
@@ -4722,6 +4885,7 @@ impl Niri {
     fn render_layer_popups<R: NiriRenderer>(
         &self,
         mut ctx: RenderCtx<R>,
+        workspace: Option<&Workspace<Mapped>>,
         ns: Option<usize>,
         layer_map: &LayerMap,
         layer: Layer,
@@ -4730,6 +4894,9 @@ impl Niri {
         push: &mut dyn FnMut(LayerSurfaceRenderElement<R>),
     ) {
         for (mapped, geo) in self.layers_in_render_order(layer_map, layer, for_backdrop) {
+            if !Self::layer_visible_on_workspace(mapped, workspace) {
+                continue;
+            }
             let loc = geo.loc.to_f64();
             let xray_pos = xray_pos.offset(loc);
             mapped.render_popups(ctx.r(), ns, loc, xray_pos, push);
@@ -5025,16 +5192,30 @@ impl Niri {
                 // refactor to draw background effects outside offscreens it won't be a problem.
                 if is_background && !render_element_states.element_was_presented(id.clone()) {
                     // A layer may be present either in background or backdrop, never in both.
-                    if xray_bg
-                        .render_element_states()
-                        .is_some_and(|s| s.element_was_presented(id.clone()))
+                    if render_element_states.element_was_presented(xray_bg.id().clone())
+                        && xray_bg
+                            .render_element_states()
+                            .is_some_and(|s| s.element_was_presented(id.clone()))
                     {
                         id = xray_bg.id().clone();
-                    } else if xray_bd
-                        .render_element_states()
-                        .is_some_and(|s| s.element_was_presented(id.clone()))
+                    } else if render_element_states.element_was_presented(xray_bd.id().clone())
+                        && xray_bd
+                            .render_element_states()
+                            .is_some_and(|s| s.element_was_presented(id.clone()))
                     {
                         id = xray_bd.id().clone();
+                    } else {
+                        for buffers in xray.workspace_backgrounds.values() {
+                            let buffer = buffers[RenderTarget::Output as usize].borrow();
+                            if render_element_states.element_was_presented(buffer.id().clone())
+                                && buffer
+                                    .render_element_states()
+                                    .is_some_and(|s| s.element_was_presented(id.clone()))
+                            {
+                                id = buffer.id().clone();
+                                break;
+                            }
+                        }
                     }
                 }
 

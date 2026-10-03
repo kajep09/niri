@@ -19,6 +19,12 @@ pub struct LayerRule {
     pub geometry_corner_radius: Option<CornerRadius>,
     #[knuffel(child, unwrap(argument))]
     pub place_within_backdrop: Option<bool>,
+    /// Restrict a background surface to a named workspace.
+    #[knuffel(child, unwrap(argument))]
+    pub place_on_workspace: Option<String>,
+    /// Restrict a background surface to a stable IPC workspace ID.
+    #[knuffel(child, unwrap(argument))]
+    pub place_on_workspace_id: Option<u64>,
     #[knuffel(child, unwrap(argument))]
     pub baba_is_float: Option<bool>,
     #[knuffel(child, default)]

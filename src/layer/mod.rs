@@ -7,6 +7,22 @@ use smithay::wayland::shell::wlr_layer::Layer;
 pub mod mapped;
 pub use mapped::MappedLayer;
 
+/// Workspace identity, independent of output-local indices and render-cache keys.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkspaceTarget {
+    Name(String),
+    Id(u64),
+}
+
+impl WorkspaceTarget {
+    pub fn matches(&self, id: u64, name: Option<&str>) -> bool {
+        match self {
+            Self::Name(target) => name.is_some_and(|name| name.eq_ignore_ascii_case(target)),
+            Self::Id(target) => *target == id,
+        }
+    }
+}
+
 /// Rules fully resolved for a layer-shell surface.
 #[derive(Debug, Default, PartialEq)]
 pub struct ResolvedLayerRules {
@@ -24,6 +40,9 @@ pub struct ResolvedLayerRules {
 
     /// Whether to place this layer surface within the overview backdrop.
     pub place_within_backdrop: bool,
+
+    /// Optional workspace restriction for a background surface.
+    pub workspace: Option<WorkspaceTarget>,
 
     /// Whether to bob this window up and down.
     pub baba_is_float: bool,
@@ -72,6 +91,12 @@ impl ResolvedLayerRules {
             if let Some(x) = rule.place_within_backdrop {
                 resolved.place_within_backdrop = x;
             }
+            if let Some(x) = &rule.place_on_workspace {
+                resolved.workspace = Some(WorkspaceTarget::Name(x.clone()));
+            }
+            if let Some(x) = rule.place_on_workspace_id {
+                resolved.workspace = Some(WorkspaceTarget::Id(x));
+            }
             if let Some(x) = rule.baba_is_float {
                 resolved.baba_is_float = x;
             }
@@ -85,6 +110,11 @@ impl ResolvedLayerRules {
             resolved.popups.merge_with(&rule.popups);
         }
 
+        // Workspace scoping only applies to the background layer. Backdrop
+        // placement takes precedence, matching its output-wide semantics.
+        if surface.layer() != Layer::Background || resolved.place_within_backdrop {
+            resolved.workspace = None;
+        }
         resolved
     }
 }

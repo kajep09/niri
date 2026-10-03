@@ -930,6 +930,8 @@ mod tests {
             layer-rule {
                 match namespace="^notifications$"
                 block-out-from "screencast"
+                place-on-workspace "work"
+                place-on-workspace-id 42
             }
 
             binds {
@@ -1966,6 +1968,12 @@ mod tests {
                     },
                     geometry_corner_radius: None,
                     place_within_backdrop: None,
+                    place_on_workspace: Some(
+                        "work",
+                    ),
+                    place_on_workspace_id: Some(
+                        42,
+                    ),
                     baba_is_float: None,
                     background_effect: BackgroundEffectRule {
                         xray: None,
